@@ -30,16 +30,12 @@ function generatePassword() {
 }
 
 async function solveCaptcha(page) {
-    // Find the CAPTCHA iframe
-    const iframeElement = await page.waitForSelector('iframe[src*="funcaptcha"]', { timeout: 15000 });
+    const iframeElement = await page.waitForSelector('iframe[src*="funcaptcha"]', { timeout: 10000 });
     const frame = await iframeElement.contentFrame();
-    
-    // Get public key from iframe URL
     const src = await frame.evaluate(() => window.location.href);
     const publicKeyMatch = src.match(/pkey=([^&]+)/);
     const publicKey = publicKeyMatch ? publicKeyMatch[1] : '476068BF-9607-4799-B53D-966BE98E2B81';
     
-    // Create Capsolver task
     const taskPayload = {
         clientKey: CAPSOLVER_API_KEY,
         task: {
@@ -52,55 +48,35 @@ async function solveCaptcha(page) {
     const createRes = await axios.post('https://api.capsolver.com/createTask', taskPayload);
     const taskId = createRes.data.taskId;
     
-    // Poll for result
-    for (let i = 0; i < 30; i++) {
-        await new Promise(r => setTimeout(r, 2000));
+    for (let i = 0; i < 20; i++) {
+        await new Promise(r => setTimeout(r, 1500));
         const getRes = await axios.post('https://api.capsolver.com/getTaskResult', {
             clientKey: CAPSOLVER_API_KEY,
             taskId
         });
-        if (getRes.data.status === 'ready') {
-            return getRes.data.solution.token;
-        }
+        if (getRes.data.status === 'ready') return getRes.data.solution.token;
     }
-    throw new Error('CAPTCHA solving timeout');
+    throw new Error('CAPTCHA timeout');
 }
 
-async function createAccount() {
-    const browser = await puppeteer.launch({
-        headless: 'new',
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
-    
-    const page = await browser.newPage();
-    const username = generateUsername();
-    const password = generatePassword();
-    
+// Single account creation using a shared page
+async function createAccountOnPage(page, username, password, capsolverKey) {
     try {
-        console.log(`[+] Trying: ${username}`);
+        console.log(`[+] Starting: ${username}`);
         
-        await page.goto('https://www.roblox.com/account/signupredir', { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto('https://www.roblox.com/account/signupredir', { waitUntil: 'domcontentloaded', timeout: 15000 });
         
-        // Fill username
-        await page.waitForSelector('#signup-username', { timeout: 10000 });
+        await page.waitForSelector('#signup-username', { timeout: 5000 });
         await page.type('#signup-username', username);
-        
-        // Fill password
         await page.type('#signup-password', password);
         
-        // Set birthday
         await page.select('#MonthDropdown', 'Jan');
         await page.select('#DayDropdown', '15');
         await page.select('#YearDropdown', '2000');
         
-        // Click signup button
         await page.click('#signup-button');
-        console.log(`[+] Signup submitted, checking for CAPTCHA...`);
         
-        // Wait 3 seconds for CAPTCHA to potentially load
-        await new Promise(r => setTimeout(r, 3000));
-        
-        // Check if CAPTCHA iframe exists
+        // Check for CAPTCHA very quickly (no extra sleep)
         let captchaPresent = false;
         try {
             const iframe = await page.$('iframe[src*="funcaptcha"]');
@@ -108,9 +84,7 @@ async function createAccount() {
         } catch (e) {}
         
         if (captchaPresent) {
-            console.log(`[+] CAPTCHA detected, solving...`);
             const token = await solveCaptcha(page);
-            // Submit the token
             await page.evaluate((t) => {
                 const input = document.querySelector('input[name="captcha-solution"]');
                 if (input) input.value = t;
@@ -118,30 +92,45 @@ async function createAccount() {
                 if (form) form.submit();
             }, token);
         } else {
-            console.log(`[+] No CAPTCHA detected, submitting directly...`);
-            // Click the submit button again if needed
             await page.evaluate(() => {
                 const form = document.querySelector('form');
                 if (form) form.submit();
             });
         }
         
-        // Wait for navigation to home page (account created)
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
+        // Wait for redirect
+        await page.waitForFunction(() => window.location.href.includes('https://www.roblox.com/home'), { timeout: 30000 });
         
-        // Get cookies
         const cookies = await page.cookies();
         const robloxCookie = cookies.find(c => c.name === '.ROBLOSECURITY')?.value;
-        if (!robloxCookie) throw new Error('No .ROBLOSECURITY cookie');
+        if (!robloxCookie) throw new Error('No cookie');
         
-        console.log(`[SUCCESS] ${username} | ${password}`);
+        console.log(`[SUCCESS] ${username}`);
         return { username, password, cookie: robloxCookie };
-        
     } catch (err) {
         console.error(`[FAIL] ${username}:`, err.message);
         return null;
-    } finally {
-        await browser.close();
+    }
+}
+
+// Worker that creates accounts continuously on a dedicated page
+async function worker(browser, capsolverKey, workerId) {
+    while (true) {
+        const page = await browser.newPage();
+        const username = generateUsername();
+        const password = generatePassword();
+        try {
+            const account = await createAccountOnPage(page, username, password, capsolverKey);
+            if (account) {
+                await sendToDiscord(account);
+            }
+        } catch (err) {
+            console.error(`Worker ${workerId} error:`, err.message);
+        } finally {
+            await page.close();
+        }
+        // Small delay to avoid hammering
+        await new Promise(r => setTimeout(r, 500));
     }
 }
 
@@ -152,35 +141,29 @@ async function sendToDiscord(account) {
         fields: [
             { name: 'Username', value: account.username, inline: true },
             { name: 'Password', value: `||${account.password}||`, inline: true },
-            { name: 'Cookie (.ROBLOSECURITY)', value: `||${account.cookie}||`, inline: false }
+            { name: 'Cookie', value: `||${account.cookie}||`, inline: false }
         ]
     };
     try {
         await axios.post(WEBHOOK_URL, { embeds: [embed] });
         console.log('[+] Webhook sent');
-    } catch (err) {
-        console.error('Webhook error:', err.message);
-    }
+    } catch (err) {}
 }
 
 async function main() {
-    console.log('🚀 Roblox Account Generator Started (CAPTCHA optional)');
-    let consecutiveFailures = 0;
-    while (true) {
-        const account = await createAccount();
-        if (account) {
-            await sendToDiscord(account);
-            consecutiveFailures = 0;
-            await new Promise(r => setTimeout(r, 1000)); // tiny delay
-        } else {
-            consecutiveFailures++;
-            if (consecutiveFailures > 3) {
-                console.log('Too many failures, waiting 30s...');
-                await new Promise(r => setTimeout(r, 30000));
-                consecutiveFailures = 0;
-            }
-        }
+    console.log('🚀 ULTRA-FAST Roblox Generator (Concurrent)');
+    const browser = await puppeteer.launch({
+        headless: 'new',
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+    });
+    
+    // Run 3 concurrent workers
+    const workers = [];
+    for (let i = 1; i <= 3; i++) {
+        workers.push(worker(browser, CAPSOLVER_API_KEY, i));
+        console.log(`Started worker ${i}`);
     }
+    await Promise.all(workers);
 }
 
 main();
