@@ -30,36 +30,40 @@ function generatePassword() {
 }
 
 async function solveCaptcha(page) {
-    const captchaData = await page.evaluate(() => {
-        const iframe = document.querySelector('iframe[src*="funcaptcha"]');
-        if (!iframe) throw new Error('No FunCaptcha iframe');
-        const src = iframe.src;
-        const pkey = src.match(/pkey=([^&]+)/)?.[1] || '476068BF-9607-4799-B53D-966BE98E2B81';
-        const blob = src.match(/blob=([^&]+)/)?.[1] || '';
-        return { publicKey: pkey, blob: decodeURIComponent(blob) };
-    });
-
-    const task = {
+    // Find the CAPTCHA iframe
+    const iframeElement = await page.waitForSelector('iframe[src*="funcaptcha"]', { timeout: 15000 });
+    const frame = await iframeElement.contentFrame();
+    
+    // Get public key from iframe URL
+    const src = await frame.evaluate(() => window.location.href);
+    const publicKeyMatch = src.match(/pkey=([^&]+)/);
+    const publicKey = publicKeyMatch ? publicKeyMatch[1] : '476068BF-9607-4799-B53D-966BE98E2B81';
+    
+    // Create Capsolver task
+    const taskPayload = {
         clientKey: CAPSOLVER_API_KEY,
         task: {
             type: 'FunCaptchaTaskProxyless',
             websiteURL: 'https://www.roblox.com/',
-            websitePublicKey: captchaData.publicKey,
-            data: JSON.stringify({ blob: captchaData.blob })
+            websitePublicKey: publicKey,
+            data: JSON.stringify({ blob: '' })
         }
     };
-    const createRes = await axios.post('https://api.capsolver.com/createTask', task);
+    const createRes = await axios.post('https://api.capsolver.com/createTask', taskPayload);
     const taskId = createRes.data.taskId;
-
+    
+    // Poll for result
     for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 2000));
         const getRes = await axios.post('https://api.capsolver.com/getTaskResult', {
             clientKey: CAPSOLVER_API_KEY,
             taskId
         });
-        if (getRes.data.status === 'ready') return getRes.data.solution.token;
+        if (getRes.data.status === 'ready') {
+            return getRes.data.solution.token;
+        }
     }
-    throw new Error('CAPTCHA timeout');
+    throw new Error('CAPTCHA solving timeout');
 }
 
 async function createAccount() {
@@ -67,68 +71,74 @@ async function createAccount() {
         headless: 'new',
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
     });
+    
     const page = await browser.newPage();
     const username = generateUsername();
     const password = generatePassword();
-
+    
     try {
         console.log(`[+] Trying: ${username}`);
+        
         await page.goto('https://www.roblox.com/account/signupredir', { waitUntil: 'networkidle2', timeout: 30000 });
-
-        // Wait for username field
+        
+        // Fill username
         await page.waitForSelector('#signup-username', { timeout: 10000 });
         await page.type('#signup-username', username);
+        
+        // Fill password
         await page.type('#signup-password', password);
-
-        // Birthday dropdowns – use the correct selectors
+        
+        // Set birthday
         await page.select('#MonthDropdown', 'Jan');
         await page.select('#DayDropdown', '15');
         await page.select('#YearDropdown', '2000');
-
+        
         // Click signup button
         await page.click('#signup-button');
-        console.log(`[+] Signup button clicked, waiting for CAPTCHA...`);
-
-        // Wait for CAPTCHA iframe – increase timeout and add fallback
+        console.log(`[+] Signup submitted, checking for CAPTCHA...`);
+        
+        // Wait 3 seconds for CAPTCHA to potentially load
+        await new Promise(r => setTimeout(r, 3000));
+        
+        // Check if CAPTCHA iframe exists
+        let captchaPresent = false;
         try {
-            await page.waitForSelector('iframe[src*="funcaptcha"]', { timeout: 20000 });
-        } catch (err) {
-            // If CAPTCHA doesn't appear, maybe the form had an error. Check for error message.
-            const errorMsg = await page.evaluate(() => {
-                const err = document.querySelector('.error-alert, .error-message, .input-validation-error');
-                return err ? err.innerText : null;
+            const iframe = await page.$('iframe[src*="funcaptcha"]');
+            if (iframe) captchaPresent = true;
+        } catch (e) {}
+        
+        if (captchaPresent) {
+            console.log(`[+] CAPTCHA detected, solving...`);
+            const token = await solveCaptcha(page);
+            // Submit the token
+            await page.evaluate((t) => {
+                const input = document.querySelector('input[name="captcha-solution"]');
+                if (input) input.value = t;
+                const form = document.querySelector('form');
+                if (form) form.submit();
+            }, token);
+        } else {
+            console.log(`[+] No CAPTCHA detected, submitting directly...`);
+            // Click the submit button again if needed
+            await page.evaluate(() => {
+                const form = document.querySelector('form');
+                if (form) form.submit();
             });
-            if (errorMsg) throw new Error(`Form error: ${errorMsg}`);
-            throw new Error('CAPTCHA iframe not loaded');
         }
-
-        const token = await solveCaptcha(page);
-        console.log(`[+] CAPTCHA solved`);
-
-        // Submit token
-        await page.evaluate((t) => {
-            const input = document.querySelector('input[name="captcha-solution"]');
-            if (input) input.value = t;
-            const form = document.querySelector('form');
-            if (form) form.submit();
-        }, token);
-
-        // Wait for navigation to home page
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
-
+        
+        // Wait for navigation to home page (account created)
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 45000 });
+        
+        // Get cookies
         const cookies = await page.cookies();
         const robloxCookie = cookies.find(c => c.name === '.ROBLOSECURITY')?.value;
-        if (!robloxCookie) throw new Error('No .ROBLOSECURITY cookie found');
-
-        console.log(`[SUCCESS] ${username}:${password}`);
+        if (!robloxCookie) throw new Error('No .ROBLOSECURITY cookie');
+        
+        console.log(`[SUCCESS] ${username} | ${password}`);
         return { username, password, cookie: robloxCookie };
+        
     } catch (err) {
         console.error(`[FAIL] ${username}:`, err.message);
-        // Take screenshot for debugging
-        try {
-            const screenshot = await page.screenshot({ encoding: 'base64' });
-            console.log(`[DEBUG] Screenshot data available (length ${screenshot.length})`);
-        } catch (e) {}
         return null;
     } finally {
         await browser.close();
@@ -138,11 +148,11 @@ async function createAccount() {
 async function sendToDiscord(account) {
     const embed = {
         title: '✅ New Roblox Account',
-        color: 0x00ff00,
+        color: 0x57F287,
         fields: [
             { name: 'Username', value: account.username, inline: true },
             { name: 'Password', value: `||${account.password}||`, inline: true },
-            { name: 'Cookie', value: `||${account.cookie}||`, inline: false }
+            { name: 'Cookie (.ROBLOSECURITY)', value: `||${account.cookie}||`, inline: false }
         ]
     };
     try {
@@ -154,12 +164,22 @@ async function sendToDiscord(account) {
 }
 
 async function main() {
-    console.log('Roblox Account Generator Started');
+    console.log('🚀 Roblox Account Generator Started (CAPTCHA optional)');
+    let consecutiveFailures = 0;
     while (true) {
         const account = await createAccount();
-        if (account) await sendToDiscord(account);
-        // Optional: add a small delay to avoid rate limiting
-        await new Promise(r => setTimeout(r, 2000));
+        if (account) {
+            await sendToDiscord(account);
+            consecutiveFailures = 0;
+            await new Promise(r => setTimeout(r, 1000)); // tiny delay
+        } else {
+            consecutiveFailures++;
+            if (consecutiveFailures > 3) {
+                console.log('Too many failures, waiting 30s...');
+                await new Promise(r => setTimeout(r, 30000));
+                consecutiveFailures = 0;
+            }
+        }
     }
 }
 
