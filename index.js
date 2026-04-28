@@ -30,7 +30,6 @@ function generatePassword() {
 }
 
 async function solveCaptcha(page) {
-    // Extract FunCaptcha parameters
     const captchaData = await page.evaluate(() => {
         const iframe = document.querySelector('iframe[src*="funcaptcha"]');
         if (!iframe) throw new Error('No FunCaptcha iframe');
@@ -40,7 +39,6 @@ async function solveCaptcha(page) {
         return { publicKey: pkey, blob: decodeURIComponent(blob) };
     });
 
-    // Create task on Capsolver
     const task = {
         clientKey: CAPSOLVER_API_KEY,
         task: {
@@ -53,7 +51,6 @@ async function solveCaptcha(page) {
     const createRes = await axios.post('https://api.capsolver.com/createTask', task);
     const taskId = createRes.data.taskId;
 
-    // Poll for result
     for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 2000));
         const getRes = await axios.post('https://api.capsolver.com/getTaskResult', {
@@ -78,21 +75,33 @@ async function createAccount() {
         console.log(`[+] Trying: ${username}`);
         await page.goto('https://www.roblox.com/account/signupredir', { waitUntil: 'networkidle2', timeout: 30000 });
 
-        // Wait for signup form
+        // Wait for username field
         await page.waitForSelector('#signup-username', { timeout: 10000 });
         await page.type('#signup-username', username);
         await page.type('#signup-password', password);
 
-        // Birthday
+        // Birthday dropdowns – use the correct selectors
         await page.select('#MonthDropdown', 'Jan');
         await page.select('#DayDropdown', '15');
         await page.select('#YearDropdown', '2000');
 
-        // Click signup
+        // Click signup button
         await page.click('#signup-button');
+        console.log(`[+] Signup button clicked, waiting for CAPTCHA...`);
 
-        // Wait for CAPTCHA
-        await page.waitForSelector('iframe[src*="funcaptcha"]', { timeout: 15000 });
+        // Wait for CAPTCHA iframe – increase timeout and add fallback
+        try {
+            await page.waitForSelector('iframe[src*="funcaptcha"]', { timeout: 20000 });
+        } catch (err) {
+            // If CAPTCHA doesn't appear, maybe the form had an error. Check for error message.
+            const errorMsg = await page.evaluate(() => {
+                const err = document.querySelector('.error-alert, .error-message, .input-validation-error');
+                return err ? err.innerText : null;
+            });
+            if (errorMsg) throw new Error(`Form error: ${errorMsg}`);
+            throw new Error('CAPTCHA iframe not loaded');
+        }
+
         const token = await solveCaptcha(page);
         console.log(`[+] CAPTCHA solved`);
 
@@ -100,21 +109,26 @@ async function createAccount() {
         await page.evaluate((t) => {
             const input = document.querySelector('input[name="captcha-solution"]');
             if (input) input.value = t;
-            document.querySelector('form')?.submit();
+            const form = document.querySelector('form');
+            if (form) form.submit();
         }, token);
 
-        // Wait for redirect to home
+        // Wait for navigation to home page
         await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 });
 
-        // Get cookie
         const cookies = await page.cookies();
         const robloxCookie = cookies.find(c => c.name === '.ROBLOSECURITY')?.value;
-        if (!robloxCookie) throw new Error('No cookie');
+        if (!robloxCookie) throw new Error('No .ROBLOSECURITY cookie found');
 
         console.log(`[SUCCESS] ${username}:${password}`);
         return { username, password, cookie: robloxCookie };
     } catch (err) {
         console.error(`[FAIL] ${username}:`, err.message);
+        // Take screenshot for debugging
+        try {
+            const screenshot = await page.screenshot({ encoding: 'base64' });
+            console.log(`[DEBUG] Screenshot data available (length ${screenshot.length})`);
+        } catch (e) {}
         return null;
     } finally {
         await browser.close();
@@ -144,7 +158,8 @@ async function main() {
     while (true) {
         const account = await createAccount();
         if (account) await sendToDiscord(account);
-        // No delay – maximum speed
+        // Optional: add a small delay to avoid rate limiting
+        await new Promise(r => setTimeout(r, 2000));
     }
 }
 
